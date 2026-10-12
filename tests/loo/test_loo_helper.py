@@ -2,6 +2,7 @@
 
 # pylint: disable=redefined-outer-name, unused-argument
 import warnings
+from fractions import Fraction
 
 import numpy as np
 import pytest
@@ -970,3 +971,80 @@ def test_diff_srs_estimator_edge_case_full_sample():
     assert isinstance(subsampling_se, float)
     assert isinstance(total_se, float)
     assert subsampling_se == 0.0
+
+
+def test_shift_and_scale_numerical_stability():
+    """Test that _shift_and_scale avoids catastrophic cancellation for large offset."""
+    offset = 1e9
+    x_vals = [offset - 1.0, offset + 1.0]
+    weights = [0.2, 0.8]
+
+    x_frac = [Fraction(10**9 - 1, 1), Fraction(10**9 + 1, 1)]
+    w_frac = [Fraction(2, 10), Fraction(8, 10)]
+    mean_orig_f = (x_frac[0] + x_frac[1]) / 2
+    var_orig_f = ((x_frac[0] - mean_orig_f) ** 2 + (x_frac[1] - mean_orig_f) ** 2) / (2 - 1)
+    mean_w_f = w_frac[0] * x_frac[0] + w_frac[1] * x_frac[1]
+    mii_f = (
+        w_frac[0] * (x_frac[0] - mean_w_f) ** 2 + w_frac[1] * (x_frac[1] - mean_w_f) ** 2
+    ) * 2
+    expected_scaling = float((mii_f / var_orig_f) ** Fraction(1, 2))
+
+    upars = xr.DataArray(
+        np.array(x_vals, dtype=np.float64).reshape((1, 2, 1)),
+        dims=["chain", "draw", "param"],
+        coords={"chain": [0], "draw": [0, 1], "param": [0]},
+    )
+    lwi = xr.DataArray(
+        np.log(np.array(weights, dtype=np.float64)).reshape((1, 2)),
+        dims=["chain", "draw"],
+        coords={"chain": [0], "draw": [0, 1]},
+    )
+    res = _shift_and_scale(upars, lwi)
+    assert_allclose(res.scaling[0], expected_scaling, rtol=1e-7)
+
+
+def test_diff_srs_estimator_numerical_stability():
+    """Test that _diff_srs_estimator avoids precision loss in difference of squares."""
+    y = 1e8
+    x1 = float(np.nextafter(y, np.inf))
+    x2 = float(np.nextafter(x1, np.inf))
+    elpd_sample = xr.DataArray([x1, x2])
+    lpd_approx_sample = xr.DataArray([y, y])
+    lpd_approx_all = xr.DataArray([1.0, -1.0, 1.0, -1.0])
+    n_data_points = 4
+
+    # High-precision reference using exact Fraction arithmetic
+    xf1, xf2, yf = Fraction(x1), Fraction(x2), Fraction(y)
+    pt_diff = [xf1 - yf, xf2 - yf]
+    approx_all_f = [Fraction(1), Fraction(-1), Fraction(1), Fraction(-1)]
+
+    lpd_approx_sum_all = sum(approx_all_f)
+    scaled_mean_pointwise_diff = n_data_points * (sum(pt_diff) / 2)
+    elpd_loo_estimate = lpd_approx_sum_all + scaled_mean_pointwise_diff
+
+    mean_diff = sum(pt_diff) / 2
+    variance = sum((d - mean_diff) ** 2 for d in pt_diff) / (2 - 1)
+    finite_pop_correction = 1 - Fraction(2, n_data_points)
+    subsampling_variance = (n_data_points**2) * finite_pop_correction * variance / 2
+
+    lpd_approx_sq_sum_all = sum(a**2 for a in approx_all_f)
+    mean_sq_diff = (xf1**2 - yf**2 + xf2**2 - yf**2) / 2
+    scaled_mean_sq_diff = n_data_points * mean_sq_diff
+
+    tot_var_f = (
+        lpd_approx_sq_sum_all
+        + scaled_mean_sq_diff
+        - (Fraction(1, n_data_points))
+        * (
+            scaled_mean_pointwise_diff**2
+            - subsampling_variance
+            + 2 * lpd_approx_sum_all * elpd_loo_estimate
+            - lpd_approx_sum_all**2
+        )
+    )
+    expected_total_se = float(tot_var_f ** Fraction(1, 2))
+
+    _, _, total_se = _diff_srs_estimator(
+        elpd_sample, lpd_approx_sample, lpd_approx_all, n_data_points
+    )
+    assert_allclose(total_se, expected_total_se, rtol=1e-4)
